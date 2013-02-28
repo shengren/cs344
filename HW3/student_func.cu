@@ -85,33 +85,72 @@
 
 #include <cstdio>
 
-__global__ void reduce(const float * const d_in,
-                       float * const d_out,
-                       const size_t num,
-                       int k,
-                       const int op) {
+__global__ void ReduceOnce(float* const d,
+                           const size_t n,
+                           const size_t w,
+                           const int op) {
   int tidx = blockIdx.x * blockDim.x + threadIdx.x;
 
-  d_out[tidx] = d_in[tidx];
-  if (tidx + (1 << k) < num)
-    d_out[tidx + (1 << k)] = d_in[tidx + (1 << k)];
+  if (tidx >= w)
+    return;
+
+  float a = d[tidx];
+  if (tidx + w < n) {
+    float b = d[tidx + w];
+    a = (op == 0) ? min(a, b) : max(a, b);
+  }
+  d[tidx] = a;
+}
+
+__global__ void BuildHistogram(const float* const d_val,
+                               const size_t num_val,
+                               unsigned int* const d_bin,
+                               const size_t num_bin,
+                               const float min_val,
+                               const float range) {
+  int tidx = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (tidx >= num_val)
+    return;
+
+  unsigned int bin_idx =
+    min((unsigned int)(num_bin - 1),
+        (unsigned int)((d_val[tidx] - min_val) / range * num_bin));
+  atomicAdd(&d_bin[bin_idx], 1);
+}
+
+__global__ void ExclusivePrefixSum(const unsigned int* const d_histo,
+                                   unsigned int* const d_cdf,
+                                   const size_t num_bin) {
+  __shared__ unsigned int bin[1024];
+  
+  int tidx = threadIdx.x;
+
+  bin[tidx] = d_histo[tidx];
   __syncthreads();
 
-  for (; k >= 0; --k) {
-    float a;
-    if (tidx < (1 << k)) {
-      a = d_out[tidx];
-      if (tidx + (1 << k) < num) {
-        float b = d_out[tidx + (1 << k)];
-        a = (op == 0) ? min(a, b) : max(a, b);
-      }
-    }
-    __syncthreads();
-
-    if (tidx < (1 << k))
-      d_out[tidx] = a;
+  // Reduce
+  for (size_t w = 2; w <= 1024; w <<= 1) {
+    if (tidx % w == w - 1)
+      bin[tidx] += bin[tidx - w / 2];
     __syncthreads();
   }
+
+  // Downsweep
+  if (tidx == 1023)
+    bin[1023] = 0;
+  __syncthreads();
+
+  for (size_t w = 1024; w >= 2; w >>= 1) {
+    if (tidx % w == w - 1) {
+      unsigned int s = bin[tidx - w / 2] + bin[tidx];
+      bin[tidx - w / 2] = bin[tidx];
+      bin[tidx] = s;
+    }
+    __syncthreads();
+  }
+
+  d_cdf[tidx] = bin[tidx];
 }
 
 void your_histogram_and_prefixsum(const float* const d_logLuminance,
@@ -122,7 +161,6 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
                                   const size_t numCols,
                                   const size_t numBins)
 {
-  //TODO
   /*Here are the steps you need to implement
     1) find the minimum and maximum value in the input logLuminance channel
        store in min_logLum and max_logLum
@@ -133,56 +171,85 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
        the cumulative distribution of luminance values (this should go in the
        incoming d_cdf pointer which already has been allocated for you)       */
 
+  const size_t MAX_NUM_THREADS_PER_BLOCK = 1024;
+
   const size_t numPixels = numRows * numCols;
 
-  int numSteps = 1;
-  while ((1 << numSteps) < numPixels)
-    ++numSteps;
-  printf("%d %d\n", numPixels, numSteps);
-
-  const size_t NUM_THREADS_LIMIT = 1024;
-  const dim3 blockSize(NUM_THREADS_LIMIT);
-  const size_t numThreads = (numPixels + 1) / 2;
-  const dim3 gridSize((numThreads + NUM_THREADS_LIMIT - 1) / NUM_THREADS_LIMIT);
+  int exponent = 0;
+  while ((1 << (exponent + 1)) < numPixels)
+    ++exponent;
 
   float *d_aux;
   checkCudaErrors(cudaMalloc(&d_aux, sizeof(float) * numPixels));
 
-  /*reduce<<<gridSize, blockSize>>>(d_logLuminance, d_aux, numPixels, numSteps - 1, 0);  // min
-  cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
-
+  // Find min_logLum
+  checkCudaErrors(cudaMemcpy(d_aux,
+                             d_logLuminance,
+                             sizeof(float) * numPixels,
+                             cudaMemcpyDeviceToDevice));
+  for (size_t width = 1 << exponent; width >= 1; width >>= 1) {
+    const dim3 blockSize(MAX_NUM_THREADS_PER_BLOCK);
+    const dim3 gridSize((width + MAX_NUM_THREADS_PER_BLOCK - 1) /
+                        MAX_NUM_THREADS_PER_BLOCK);
+    ReduceOnce<<<gridSize, blockSize>>>(d_aux, numPixels, width, 0);  // 0 - min
+  }
   float h_min_logLum;
-  checkCudaErrors(cudaMemcpy(&h_min_logLum, d_aux, sizeof(float), cudaMemcpyDeviceToHost));
+  checkCudaErrors(cudaMemcpy(&h_min_logLum,
+                             d_aux,
+                             sizeof(float),
+                             cudaMemcpyDeviceToHost));
   min_logLum = h_min_logLum;
 
-  printf("%f\n", min_logLum);*/
-
-  reduce<<<gridSize, blockSize>>>(d_logLuminance, d_aux, numPixels, numSteps - 1, 1);  // max
-  cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
-
+  // Find max_logLum
+  checkCudaErrors(cudaMemcpy(d_aux,
+                             d_logLuminance,
+                             sizeof(float) * numPixels,
+                             cudaMemcpyDeviceToDevice));
+  for (size_t width = 1 << exponent; width >= 1; width >>= 1) {
+    const dim3 blockSize(MAX_NUM_THREADS_PER_BLOCK);
+    const dim3 gridSize((width + MAX_NUM_THREADS_PER_BLOCK - 1) /
+                        MAX_NUM_THREADS_PER_BLOCK);
+    ReduceOnce<<<gridSize, blockSize>>>(d_aux, numPixels, width, 1);  // 1 - max
+  }
   float h_max_logLum;
-  checkCudaErrors(cudaMemcpy(&h_max_logLum, d_aux, sizeof(float), cudaMemcpyDeviceToHost));
+  checkCudaErrors(cudaMemcpy(&h_max_logLum,
+                             d_aux,
+                             sizeof(float),
+                             cudaMemcpyDeviceToHost));
   max_logLum = h_max_logLum;
-
-  printf("%f\n", max_logLum);
-
-  reduce<<<gridSize, blockSize>>>(d_logLuminance, d_aux, numPixels, numSteps - 1, 1);  // max
-  cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
-
-  checkCudaErrors(cudaMemcpy(&h_max_logLum, d_aux, sizeof(float), cudaMemcpyDeviceToHost));
-  max_logLum = h_max_logLum;
-
-  printf("%f\n", max_logLum);
-
-  reduce<<<gridSize, blockSize>>>(d_logLuminance, d_aux, numPixels, numSteps - 1, 1);  // max
-  cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
-
-  checkCudaErrors(cudaMemcpy(&h_max_logLum, d_aux, sizeof(float), cudaMemcpyDeviceToHost));
-  max_logLum = h_max_logLum;
-
-  printf("%f\n", max_logLum);
 
   checkCudaErrors(cudaFree(d_aux));
+
+  // Find the range
+  float logLumRange = max_logLum - min_logLum;
+
+  // Build histogram
+  unsigned int *d_histo;
+  checkCudaErrors(cudaMalloc(&d_histo, sizeof(unsigned int) * numBins));
+  checkCudaErrors(cudaMemset(d_histo, 0, sizeof(unsigned int) * numBins));
+  {
+    const dim3 blockSize(MAX_NUM_THREADS_PER_BLOCK);
+    const dim3 gridSize((numPixels + MAX_NUM_THREADS_PER_BLOCK - 1) /
+                        MAX_NUM_THREADS_PER_BLOCK);
+    BuildHistogram<<<gridSize, blockSize>>>(d_logLuminance,
+                                            numPixels,
+                                            d_histo,
+                                            numBins,
+                                            min_logLum,
+                                            logLumRange);
+  }
+
+  // Calculate the cumulative distribution
+  {
+    const dim3 blockSize(MAX_NUM_THREADS_PER_BLOCK);
+    const dim3 gridSize(1);  // numBins = 1024 = MAX_NUM_THREADS_PER_BLOCK
+    const size_t sharedMemoryBytes = sizeof(unsigned int) * numBins;
+    ExclusivePrefixSum<<<gridSize, blockSize, sharedMemoryBytes>>>(d_histo,
+                                                                   d_cdf,
+                                                                   numBins);
+  }
+
+  checkCudaErrors(cudaFree(d_histo));
 
   /****************************************************************************
   * You can use the code below to help with debugging, but make sure to       *
@@ -196,6 +263,7 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
   * the two and will output the first location they differ.                   *
   * ************************************************************************* */
 
+  /*
   float *h_logLuminance = new float[numRows * numCols];
   unsigned int *h_cdf   = new unsigned int[numBins];
   unsigned int *h_your_cdf = new unsigned int[numBins];
@@ -210,4 +278,5 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
   delete[] h_logLuminance;
   delete[] h_cdf; 
   delete[] h_your_cdf;
+  */
 }
