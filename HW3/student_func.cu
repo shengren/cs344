@@ -83,6 +83,37 @@
 #include "reference_calc.cpp"
 #include "utils.h"
 
+#include <cstdio>
+
+__global__ void reduce(const float * const d_in,
+                       float * const d_out,
+                       const size_t num,
+                       int k,
+                       const int op) {
+  int tidx = blockIdx.x * blockDim.x + threadIdx.x;
+
+  d_out[tidx] = d_in[tidx];
+  if (tidx + (1 << k) < num)
+    d_out[tidx + (1 << k)] = d_in[tidx + (1 << k)];
+  __syncthreads();
+
+  for (; k >= 0; --k) {
+    float a;
+    if (tidx < (1 << k)) {
+      a = d_out[tidx];
+      if (tidx + (1 << k) < num) {
+        float b = d_out[tidx + (1 << k)];
+        a = (op == 0) ? min(a, b) : max(a, b);
+      }
+    }
+    __syncthreads();
+
+    if (tidx < (1 << k))
+      d_out[tidx] = a;
+    __syncthreads();
+  }
+}
+
 void your_histogram_and_prefixsum(const float* const d_logLuminance,
                                   unsigned int* const d_cdf,
                                   float &min_logLum,
@@ -102,8 +133,56 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
        the cumulative distribution of luminance values (this should go in the
        incoming d_cdf pointer which already has been allocated for you)       */
 
+  const size_t numPixels = numRows * numCols;
 
+  int numSteps = 1;
+  while ((1 << numSteps) < numPixels)
+    ++numSteps;
+  printf("%d %d\n", numPixels, numSteps);
 
+  const size_t NUM_THREADS_LIMIT = 1024;
+  const dim3 blockSize(NUM_THREADS_LIMIT);
+  const size_t numThreads = (numPixels + 1) / 2;
+  const dim3 gridSize((numThreads + NUM_THREADS_LIMIT - 1) / NUM_THREADS_LIMIT);
+
+  float *d_aux;
+  checkCudaErrors(cudaMalloc(&d_aux, sizeof(float) * numPixels));
+
+  /*reduce<<<gridSize, blockSize>>>(d_logLuminance, d_aux, numPixels, numSteps - 1, 0);  // min
+  cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+
+  float h_min_logLum;
+  checkCudaErrors(cudaMemcpy(&h_min_logLum, d_aux, sizeof(float), cudaMemcpyDeviceToHost));
+  min_logLum = h_min_logLum;
+
+  printf("%f\n", min_logLum);*/
+
+  reduce<<<gridSize, blockSize>>>(d_logLuminance, d_aux, numPixels, numSteps - 1, 1);  // max
+  cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+
+  float h_max_logLum;
+  checkCudaErrors(cudaMemcpy(&h_max_logLum, d_aux, sizeof(float), cudaMemcpyDeviceToHost));
+  max_logLum = h_max_logLum;
+
+  printf("%f\n", max_logLum);
+
+  reduce<<<gridSize, blockSize>>>(d_logLuminance, d_aux, numPixels, numSteps - 1, 1);  // max
+  cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+
+  checkCudaErrors(cudaMemcpy(&h_max_logLum, d_aux, sizeof(float), cudaMemcpyDeviceToHost));
+  max_logLum = h_max_logLum;
+
+  printf("%f\n", max_logLum);
+
+  reduce<<<gridSize, blockSize>>>(d_logLuminance, d_aux, numPixels, numSteps - 1, 1);  // max
+  cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+
+  checkCudaErrors(cudaMemcpy(&h_max_logLum, d_aux, sizeof(float), cudaMemcpyDeviceToHost));
+  max_logLum = h_max_logLum;
+
+  printf("%f\n", max_logLum);
+
+  checkCudaErrors(cudaFree(d_aux));
 
   /****************************************************************************
   * You can use the code below to help with debugging, but make sure to       *
@@ -117,7 +196,7 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
   * the two and will output the first location they differ.                   *
   * ************************************************************************* */
 
-  /* float *h_logLuminance = new float[numRows * numCols];
+  float *h_logLuminance = new float[numRows * numCols];
   unsigned int *h_cdf   = new unsigned int[numBins];
   unsigned int *h_your_cdf = new unsigned int[numBins];
   checkCudaErrors(cudaMemcpy(h_logLuminance, d_logLuminance, numCols * numRows * sizeof(float), cudaMemcpyDeviceToHost));
@@ -130,5 +209,5 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
  
   delete[] h_logLuminance;
   delete[] h_cdf; 
-  delete[] h_your_cdf; */
+  delete[] h_your_cdf;
 }

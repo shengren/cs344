@@ -1,5 +1,6 @@
 #include <cmath>
 #include <cassert>
+#include <cstdio>
 
 void referenceCalculation(const float* const h_logLuminance, unsigned int* const h_cdf,
                           const size_t numRows, const size_t numCols, const size_t numBins)
@@ -13,6 +14,9 @@ void referenceCalculation(const float* const h_logLuminance, unsigned int* const
     logLumMin = min(h_logLuminance[i], logLumMin);
     logLumMax = max(h_logLuminance[i], logLumMax);
   }
+
+  printf("CPU Min %f\n", logLumMin);
+  printf("CPU Max %f\n", logLumMax);
 
   //Step 2
   float logLumRange = logLumMax - logLumMin;
