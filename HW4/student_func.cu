@@ -44,77 +44,69 @@
 
  */
 
-__global__ void ExclusivePrefixSum(unsigned int* const d_histo) {
-  __shared__ unsigned int bin[1024];
-  
-  int tidx = threadIdx.x;
-
-  bin[tidx] = d_histo[tidx];
-  __syncthreads();
-
-  // Reduce
-  for (size_t w = 2; w <= 1024; w <<= 1) {
-    if (tidx % w == w - 1)
-      bin[tidx] += bin[tidx - w / 2];
-    __syncthreads();
-  }
-
-  // Downsweep
-  if (tidx == 1023)
-    bin[1023] = 0;
-  __syncthreads();
-
-  for (size_t w = 1024; w >= 2; w >>= 1) {
-    if (tidx % w == w - 1) {
-      unsigned int s = bin[tidx - w / 2] + bin[tidx];
-      bin[tidx - w / 2] = bin[tidx];
-      bin[tidx] = s;
-    }
-    __syncthreads();
-  }
-
-  d_histo[tidx] = bin[tidx];
-}
-
-__global__ void BuildHistogram(unsigned int* const d_val,
-                               const size_t num,
-                               unsigned int* const d_histo,
-                               unsigned int* const d_offset,
-                               unsigned int mask,
-                               unsigned int shift) {
-  int tidx = blockIdx.x * blockDim.x + threadIdx.x;
+__global__ void Predicate(const unsigned int* const key,
+                          const size_t num,
+                          const unsigned int bit,
+                          const unsigned int value,
+                          unsigned int* const predicate) {
+  const size_t tidx = blockIdx.x * blockDim.x + threadIdx.x;
 
   if (tidx >= num)
     return;
 
-  unsigned int key = d_val[tidx];
-  unsigned int bin_idx = ((key >> shift) & mask);
-  unsigned int offset = atomicAdd(&d_histo[bin_idx], 1);
-  d_offset[tidx] = offset;
+  if ((key[tidx] & (1 << bit)) == value)
+    predicate[tidx] = 1;
+  else
+    predicate[tidx] = 0;
 }
 
-__global__ void Move(unsigned int* const d_in_val,
-                     unsigned int* const d_in_pos,
-                     unsigned int* const d_out_val,
-                     unsigned int* const d_out_pos,
-                     const size_t num,
-                     unsigned int* const d_histo,
-                     unsigned int* const d_offset,
-                     unsigned int mask,
-                     unsigned int shift) {
-  int tidx = blockIdx.x * blockDim.x + threadIdx.x;
+__global__ void ScanStep(const unsigned int* const in,
+                         unsigned int* const out,
+                         const size_t num,
+                         const size_t width) {
+  const size_t tidx = blockIdx.x * blockDim.x + threadIdx.x;
 
   if (tidx >= num)
     return;
 
-  unsigned int val = d_in_val[tidx];
-  unsigned int pos = d_in_pos[tidx];
-  unsigned int bin_idx = ((val >> shift) & mask);
-  unsigned int base = d_histo[bin_idx];
-  unsigned int offset = d_offset[tidx];
-  unsigned int new_idx = base + offset;
-  d_out_val[new_idx] = val;
-  d_out_pos[new_idx] = pos;
+  unsigned int s = in[tidx];
+  if (tidx >= width)
+    s += in[tidx - width];
+  out[tidx] = s;
+}
+
+__global__ void ComputeNewIndex(const unsigned int* const key,
+                                const size_t num,
+                                const unsigned int bit,
+                                const unsigned int value,
+                                const unsigned int base,
+                                const unsigned int* const offset,
+                                unsigned int* const index) {
+  const size_t tidx = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (tidx >= num)
+    return;
+
+  if ((key[tidx] & (1 << bit)) == value)
+    index[tidx] = base + offset[tidx] - 1;  // inclusive -> exclusive
+}
+
+__global__ void Move(const unsigned int* const in_val,
+                     const unsigned int* const in_pos,
+                     unsigned int* const out_val,
+                     unsigned int* const out_pos,
+                     const unsigned int* const index,
+                     const size_t num) {
+  const size_t tidx = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (tidx >= num)
+    return;
+
+  unsigned int val = in_val[tidx];
+  unsigned int pos = in_pos[tidx];
+  size_t new_index = index[tidx];
+  out_val[new_index] = val;
+  out_pos[new_index] = pos;
 }
 
 void your_sort(unsigned int* const d_inputVals,
@@ -138,6 +130,7 @@ void your_sort(unsigned int* const d_inputVals,
   * Thrust containers are used for copying memory from the GPU                *
   * ************************************************************************* */
   
+  /*
   thrust::host_vector<unsigned int> h_inputVals(thrust::device_ptr<unsigned int>(d_inputVals),
                                                 thrust::device_ptr<unsigned int>(d_inputVals) + numElems);
   thrust::host_vector<unsigned int> h_inputPos(thrust::device_ptr<unsigned int>(d_inputPos),
@@ -149,66 +142,101 @@ void your_sort(unsigned int* const d_inputVals,
   reference_calculation(&h_inputVals[0], &h_inputPos[0],
                         &h_outputVals[0], &h_outputPos[0],
                         numElems);
+  */
 
-  //TODO
   //PUT YOUR SORT HERE
+  unsigned int *d_scan_ping;
+  checkCudaErrors(cudaMalloc(&d_scan_ping, sizeof(unsigned int) * numElems));
+  unsigned int *d_scan_pong;
+  checkCudaErrors(cudaMalloc(&d_scan_pong, sizeof(unsigned int) * numElems));
+  unsigned int *d_index;
+  checkCudaErrors(cudaMalloc(&d_index, sizeof(unsigned int) * numElems));
 
-  const int numBits = 10;
-  const int numBins = 1 << numBits;  // 1024
-  printf("numBits = %d numBins = %d\n", numBits, numBins);
-  unsigned int *d_histo;
-  checkCudaErrors(cudaMalloc(&d_histo, sizeof(unsigned int) * numBins));
-  unsigned int *d_offset;
-  checkCudaErrors(cudaMalloc(&d_offset, sizeof(unsigned int) * numElems));
-  unsigned int *d_mark;
-  checkCudaErrors(cudaMalloc(&d_mark, sizeof(unsigned int) * numElems));
-  const dim3 blockSize(1024);  // Max number of threads per block
+  const dim3 blockSize(1024);
   const dim3 gridSize((numElems + 1023) / 1024);
-  printf("numElems = %d, numBlocks = %d, numThreads = %d\n", numElems, gridSize.x, blockSize.x);
 
   unsigned int *d_in_val = d_inputVals;
   unsigned int *d_in_pos = d_inputPos;
   unsigned int *d_out_val = d_outputVals;
   unsigned int *d_out_pos = d_outputPos;
-  for (unsigned int i = 0; i < 32; i += numBits) {
-    printf("i = %d\n", i);
-    checkCudaErrors(cudaMemset(d_histo, 0, sizeof(unsigned int) * numBins));
-
-    BuildHistogram<<<gridSize, blockSize>>>(d_in_val,
-                                            numElems,
-                                            d_histo,
-                                            d_offset,
-                                            (1 << numBits) - 1,
-                                            i);
+  for (unsigned int bit = 0; bit < 32; ++bit) {
+    // 0
+    Predicate<<<gridSize, blockSize>>>(d_in_val, 
+                                       numElems, 
+                                       bit, 
+                                       0, 
+                                       d_scan_ping);
     cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
 
-    ExclusivePrefixSum<<<1, 1024>>>(d_histo);
-    cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
-
-    //unsigned int *h_histo = new unsigned int[1024];
-    //checkCudaErrors(cudaMemcpy(h_histo, d_histo, sizeof(unsigned int) * 1024, cudaMemcpyDeviceToHost));
-    //for (int k = 0; k < 1024; ++k)
-    //  printf("h[%d] = %d\n", k, h_histo[k]);
-    for (int j = 0; j < numBins; ++j) {
+    for (unsigned int width = 1; width < numElems; width <<= 1) {
+      ScanStep<<<gridSize, blockSize>>>(d_scan_ping, 
+                                        d_scan_pong, 
+                                        numElems, 
+                                        width);
+      cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+      // Swap. d_scan_ping has the final scan results.
+      unsigned int *t = d_scan_ping;
+      d_scan_ping = d_scan_pong;
+      d_scan_pong = t;
     }
 
-    Move<<<gridSize, blockSize>>>(d_in_val,
-                                  d_in_pos,
-                                  d_out_val,
-                                  d_out_pos,
-                                  numElems,
-                                  d_histo,
-                                  d_offset,
-                                  (1 << numBits) - 1,
-                                  i);
+    unsigned int h_numZeros;
+    checkCudaErrors(cudaMemcpy(&h_numZeros, 
+                               &d_scan_ping[numElems - 1], 
+                               sizeof(unsigned int), 
+                               cudaMemcpyDeviceToHost));
+    //printf("#0s = %d\n", h_numZeros);
+
+    ComputeNewIndex<<<gridSize, blockSize>>>(d_in_val, 
+                                             numElems, 
+                                             bit, 
+                                             0, 
+                                             0, 
+                                             d_scan_ping, 
+                                             d_index);
     cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
 
-    //unsigned int *h_test = new unsigned int[numElems];
-    //checkCudaErrors(cudaMemcpy(h_test, d_out_val, sizeof(unsigned int) * numElems, cudaMemcpyDeviceToHost));
-    //for (int k = 0; k < 10; ++k)
-    //  printf("  %d = %d\n", k, h_test[k]);
-    //delete [] h_test;
+    // 1
+    Predicate<<<gridSize, blockSize>>>(d_in_val, 
+                                       numElems, 
+                                       bit, 
+                                       (1 << bit), 
+                                       d_scan_ping);
+    cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
 
+    for (unsigned int width = 1; width < numElems; width <<= 1) {
+      ScanStep<<<gridSize, blockSize>>>(d_scan_ping, 
+                                        d_scan_pong, 
+                                        numElems, 
+                                        width);
+      cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+      // Swap. d_scan_ping has the final scan results.
+      unsigned int *t = d_scan_ping;
+      d_scan_ping = d_scan_pong;
+      d_scan_pong = t;
+    }
+    /*
+    unsigned int h_numOnes;
+    checkCudaErrors(cudaMemcpy(&h_numOnes, &d_scan_ping[numElems - 1], sizeof(unsigned int), cudaMemcpyDeviceToHost));
+    printf("#1s = %d\n", h_numOnes);
+    printf("total = %d(%d)\n", numElems, h_numZeros + h_numOnes);
+    */
+
+    ComputeNewIndex<<<gridSize, blockSize>>>(d_in_val, 
+                                             numElems, 
+                                             bit, 
+                                             (1 << bit), 
+                                             h_numZeros, 
+                                             d_scan_ping, 
+                                             d_index);
+    cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+
+    // Move
+    Move<<<gridSize, blockSize>>>(d_in_val, d_in_pos, d_out_val, d_out_pos, 
+                                  d_index, numElems);
+    cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+
+    // Swap input and output pointers
     unsigned int *t = d_in_val;
     d_in_val = d_out_val;
     d_out_val = t;
@@ -216,24 +244,26 @@ void your_sort(unsigned int* const d_inputVals,
     d_in_pos = d_out_pos;
     d_out_pos = t;
   }
-  checkCudaErrors(cudaMemcpy(d_outputVals,
-                             d_inputVals,
-                             sizeof(unsigned int) * numElems,
+  // After 32 iterations, results are in d_output*.
+  checkCudaErrors(cudaMemcpy(d_outputVals, 
+                             d_inputVals, 
+                             sizeof(unsigned int) * numElems, 
                              cudaMemcpyDeviceToDevice));
-  checkCudaErrors(cudaMemcpy(d_outputPos,
-                             d_inputPos,
-                             sizeof(unsigned int) * numElems,
+  checkCudaErrors(cudaMemcpy(d_outputPos, 
+                             d_inputPos, 
+                             sizeof(unsigned int) * numElems, 
                              cudaMemcpyDeviceToDevice));
 
-  checkCudaErrors(cudaFree(d_histo));
-  checkCudaErrors(cudaFree(d_offset));
-  checkCudaErrors(cudaFree(d_mark));
+  checkCudaErrors(cudaFree(d_scan_ping));
+  checkCudaErrors(cudaFree(d_scan_pong));
+  checkCudaErrors(cudaFree(d_index));
 
   /* *********************************************************************** *
    * Uncomment the code below to do the correctness checking between your    *
    * result and the reference.                                               *
    **************************************************************************/
 
+  /*
   thrust::host_vector<unsigned int> h_yourOutputVals(thrust::device_ptr<unsigned int>(d_outputVals),
                                                      thrust::device_ptr<unsigned int>(d_outputVals) + numElems);
   thrust::host_vector<unsigned int> h_yourOutputPos(thrust::device_ptr<unsigned int>(d_outputPos),
@@ -241,4 +271,5 @@ void your_sort(unsigned int* const d_inputVals,
 
   checkResultsExact(&h_outputVals[0], &h_yourOutputVals[0], numElems);
   checkResultsExact(&h_outputPos[0], &h_yourOutputPos[0], numElems);
+  */
 }
