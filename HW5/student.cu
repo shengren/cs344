@@ -24,22 +24,31 @@
 
 */
 
+#include <thrust/device_ptr.h>
+#include <thrust/sort.h>
 
 #include "utils.h"
 #include "reference.cpp"
-
 
 __global__
 void yourHisto(const unsigned int* const vals, //INPUT
                unsigned int* const histo,      //OUPUT
                int numVals)
 {
-  //TODO fill in this kernel to calculate the histogram
-  //as quickly as possible
+  int gidx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (gidx >= numVals)
+    return;
 
-  //Although we provide only one kernel skeleton,
-  //feel free to use more if it will help you
-  //write faster code
+  unsigned int a = vals[gidx];
+  unsigned int b;
+  if (gidx < numVals - 1)
+    b = vals[gidx + 1];
+  if (gidx == numVals - 1) {
+    atomicAdd(&histo[a], gidx + 1);
+  } else if (a != b) {
+    atomicAdd(&histo[a], gidx + 1);
+    atomicAdd(&histo[b], -(gidx + 1));
+  }
 }
 
 void computeHistogram(const unsigned int* const d_vals, //INPUT
@@ -47,12 +56,20 @@ void computeHistogram(const unsigned int* const d_vals, //INPUT
                       const unsigned int numBins,
                       const unsigned int numElems)
 {
-  //TODO Launch the yourHisto kernel
+  unsigned int *d_keys;
+  checkCudaErrors(cudaMalloc(&d_keys, sizeof(unsigned int) * numElems));
+  checkCudaErrors(cudaMemcpy(d_keys, d_vals, sizeof(unsigned int) * numElems, cudaMemcpyDeviceToDevice));
 
+  thrust::device_ptr<unsigned int> dp_keys(d_keys);
+  thrust::sort(dp_keys, dp_keys + numElems);
 
-  //if you want to use/launch more than one kernel,
-  //feel free
+  checkCudaErrors(cudaMemset(d_histo, 0, sizeof(unsigned int) * numBins));
+
+  int numBlocks = (numElems + 1023) / 1024;
+  yourHisto<<<numBlocks, 1024>>>(d_keys, d_histo, numElems);
   cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+
+  checkCudaErrors(cudaFree(d_keys));
 
   //Again we have provided a reference calculation for you
   //to help with debugging.  Uncomment the code below
@@ -60,7 +77,7 @@ void computeHistogram(const unsigned int* const d_vals, //INPUT
   //REMEMBER TO COMMENT IT OUT BEFORE GRADING
   //otherwise your code will be too slow
 
-  /*unsigned int *h_vals = new unsigned int[numElems];
+  unsigned int *h_vals = new unsigned int[numElems];
   unsigned int *h_histo = new unsigned int[numBins];
 
   checkCudaErrors(cudaMemcpy(h_vals, d_vals, sizeof(unsigned int) * numElems, cudaMemcpyDeviceToHost));
@@ -74,5 +91,5 @@ void computeHistogram(const unsigned int* const d_vals, //INPUT
 
   delete[] h_vals;
   delete[] h_histo;
-  delete[] your_histo;*/
+  delete[] your_histo;
 }
