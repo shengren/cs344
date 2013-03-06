@@ -49,6 +49,7 @@ void computeHistogram(const unsigned int* const d_vals, //INPUT
 {
   //TODO Launch the yourHisto kernel
 
+
   //if you want to use/launch more than one kernel,
   //feel free
   cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
