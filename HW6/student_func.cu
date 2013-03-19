@@ -62,7 +62,139 @@
     In this assignment we will do 800 iterations.
    */
 
+__global__ void Test(unsigned char *m,
+                     size_t nr, size_t nc,
+                     uchar4 *img) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= nr * nc)
+    return;
+  uchar4 p;
+  if (m[i] == 0)
+    p.x = p.y = p.z = 0;
+  else if (m[i] == 1)
+    p.x = p.y = p.z = 255;
+  else if (m[i] == 2)
+    p.x = p.y = p.z = 127;
+  img[i] = p;
+}
 
+__global__ void CreateMask(uchar4 *img, 
+                           size_t nr, size_t nc, 
+                           unsigned char *m) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= nr * nc)
+    return;
+  uchar4 p = img[i];
+  if (p.x + p.y + p.z < 3 * 255)
+    m[i] = 1;
+  else
+    m[i] = 0;
+}
+
+__global__ void CreateMask2(uchar4 *img, 
+                            size_t nr, size_t nc, 
+                            unsigned char *m) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= nr * nc)
+    return;
+  if (m[i] > 0 &&
+      m[i - 1] > 0 &&
+      m[i + 1] > 0 &&
+      m[i - nc] > 0 &&
+      m[i + nc] > 0)
+    m[i] = 2;
+}
+
+__global__ void SeparateChannels(uchar4 *img, 
+                                 size_t nr, size_t nc,
+                                 unsigned char *r,
+                                 unsigned char *g,
+                                 unsigned char *b) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= nr * nc)
+    return;
+  uchar4 p = img[i];
+  r[i] = p.x;
+  g[i] = p.y;
+  b[i] = p.z;
+}
+
+__global__ void ComputeG(unsigned char *c, 
+                         unsigned char *m,
+                         size_t nr, size_t nc,
+                         float *g) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= nr * nc)
+    return;
+
+  if (m[i] != 2) {
+    g[i] = 0.0f;
+    return;
+  }
+
+  float sum = 4.0f * (float)c[i];
+  sum -= (float)c[i - 1];
+  sum -= (float)c[i + 1];
+  sum -= (float)c[i - nc];
+  sum -= (float)c[i + nc];
+  g[i] = sum;
+}
+
+__global__ void Initialize(unsigned char *src, 
+                           unsigned char *dest, 
+                           unsigned char *m,
+                           size_t nr, size_t nc,
+                           float *init) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= nr * nc)
+    return;
+  unsigned char c;
+  if (m[i] == 2)
+    c = src[i];
+  else
+    c = dest[i];
+  init[i] = (float)c;
+  //init[i] = (float)src[i];
+}
+
+__global__ void Iterate(unsigned char *m, 
+                        unsigned char *src,
+                        unsigned char *dest,
+                        float *ping, 
+                        float *g,
+                        size_t nr, size_t nc,
+                        float *pong) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= nr * nc)
+    return;
+
+  if (m[i] != 2) {
+    pong[i] = ping[i];
+    //pong[i] = src[i];
+    return;
+  }
+
+  float sum = 0.0f;
+  if (m[i - 1] == 2) sum += ping[i - 1];
+  else sum += (float)dest[i - 1];
+  if (m[i + 1] == 2) sum += ping[i + 1];
+  else sum += (float)dest[i + 1];
+  if (m[i - nc] == 2) sum += ping[i - nc];
+  else sum += (float)dest[i - nc];
+  if (m[i + nc] == 2) sum += ping[i + nc];
+  else sum += (float)dest[i + nc];
+  sum += g[i];
+  pong[i] = min(255.0f, max(0.0f, sum / 4.0f));
+}
+
+__global__ void WriteResult(float *p, size_t nr, size_t nc, size_t ci, uchar4 *res) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= nr * nc)
+    return;
+  if (ci == 0) res[i].x = (unsigned char)p[i];
+  else if (ci == 1) res[i].y = (unsigned char)p[i];
+  else if (ci == 2) res[i].z = (unsigned char)p[i];
+}
 
 #include "utils.h"
 #include <thrust/host_vector.h>
@@ -74,7 +206,8 @@ void your_blend(const uchar4* const h_sourceImg,  //IN
                 uchar4* const h_blendedImg) //OUT
 {
 
-  /* To Recap here are the steps you need to implement
+  /*
+     To Recap here are the steps you need to implement
   
      1) Compute a mask of the pixels from the source image to be copied
         The pixels that shouldn't be copied are completely white, they
@@ -112,17 +245,155 @@ void your_blend(const uchar4* const h_sourceImg,  //IN
       to catch any errors that happened while executing the kernel.
   */
 
+  size_t srcSize = numRowsSource * numColsSource;
+  dim3 gridSize((srcSize + 1023) / 1024);
+  dim3 blockSize(1024);
 
+  uchar4 *d_sourceImg = NULL;
+  checkCudaErrors(cudaMalloc(&d_sourceImg, sizeof(uchar4) * srcSize));
+  checkCudaErrors(cudaMemcpy(d_sourceImg, h_sourceImg,
+                             sizeof(uchar4) * srcSize, cudaMemcpyHostToDevice));
+  uchar4 *d_destImg = NULL;
+  checkCudaErrors(cudaMalloc(&d_destImg, sizeof(uchar4) * srcSize));
+  checkCudaErrors(cudaMemcpy(d_destImg, h_destImg,
+                             sizeof(uchar4) * srcSize, cudaMemcpyHostToDevice));
+  unsigned char *d_mask = NULL;
+  checkCudaErrors(cudaMalloc(&d_mask, sizeof(unsigned char) * srcSize));
+  unsigned char *d_srcRed = NULL;
+  unsigned char *d_srcGreen = NULL;
+  unsigned char *d_srcBlue = NULL;
+  checkCudaErrors(cudaMalloc(&d_srcRed, sizeof(unsigned char) * srcSize));
+  checkCudaErrors(cudaMalloc(&d_srcGreen, sizeof(unsigned char) * srcSize));
+  checkCudaErrors(cudaMalloc(&d_srcBlue, sizeof(unsigned char) * srcSize));
+  unsigned char *d_destRed = NULL;
+  unsigned char *d_destGreen = NULL;
+  unsigned char *d_destBlue = NULL;
+  checkCudaErrors(cudaMalloc(&d_destRed, sizeof(unsigned char) * srcSize));
+  checkCudaErrors(cudaMalloc(&d_destGreen, sizeof(unsigned char) * srcSize));
+  checkCudaErrors(cudaMalloc(&d_destBlue, sizeof(unsigned char) * srcSize));
+  float *d_ping = NULL;
+  float *d_pong = NULL;
+  checkCudaErrors(cudaMalloc(&d_ping, sizeof(float) * srcSize));
+  checkCudaErrors(cudaMalloc(&d_pong, sizeof(float) * srcSize));
+  float *d_g = NULL;
+  checkCudaErrors(cudaMalloc(&d_g, sizeof(float) * srcSize));
+  uchar4 *d_blendedImg = NULL;
+  checkCudaErrors(cudaMalloc(&d_blendedImg, sizeof(uchar4) * srcSize));
 
-  /* The reference calculation is provided below, feel free to use it
+  CreateMask<<<gridSize, blockSize>>>(d_sourceImg,
+                                      numRowsSource, numColsSource,
+                                      d_mask);
+  cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+
+  CreateMask2<<<gridSize, blockSize>>>(d_sourceImg,
+                                       numRowsSource, numColsSource,
+                                       d_mask);
+  cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+
+  SeparateChannels<<<gridSize, blockSize>>>(d_sourceImg,
+                                            numRowsSource, numColsSource,
+                                            d_srcRed, d_srcGreen, d_srcBlue);
+  cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+
+  SeparateChannels<<<gridSize, blockSize>>>(d_destImg,
+                                            numRowsSource, numColsSource,
+                                            d_destRed, d_destGreen, d_destBlue);
+  cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+
+  // Red
+  ComputeG<<<gridSize, blockSize>>>(d_srcRed, 
+                                    d_mask,
+                                    numRowsSource, numColsSource,
+                                    d_g);
+  cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+  Initialize<<<gridSize, blockSize>>>(d_srcRed,
+                                      d_destRed,
+                                      d_mask,
+                                      numRowsSource, numColsSource,
+                                      d_ping);
+  cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+  for (size_t k = 0; k < 800; ++k) {
+    Iterate<<<gridSize, blockSize>>>(d_mask,
+                                     d_srcRed,
+                                     d_destRed,
+                                     d_ping,
+                                     d_g,
+                                     numRowsSource, numColsSource,
+                                     d_pong);
+    cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+    std::swap(d_ping, d_pong);
+  }
+  WriteResult<<<gridSize, blockSize>>>(d_ping, numRowsSource, numColsSource, 0, d_blendedImg);
+  cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+
+  // Green
+  ComputeG<<<gridSize, blockSize>>>(d_srcGreen, 
+                                    d_mask,
+                                    numRowsSource, numColsSource,
+                                    d_g);
+  cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+  Initialize<<<gridSize, blockSize>>>(d_srcGreen,
+                                      d_destGreen, 
+                                      d_mask,
+                                      numRowsSource, numColsSource,
+                                      d_ping);
+  cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+  for (size_t k = 0; k < 800; ++k) {
+    Iterate<<<gridSize, blockSize>>>(d_mask,
+                                     d_srcGreen,
+                                     d_destGreen, 
+                                     d_ping, 
+                                     d_g,
+                                     numRowsSource, numColsSource,
+                                     d_pong);
+    cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+    std::swap(d_ping, d_pong);
+  }
+  WriteResult<<<gridSize, blockSize>>>(d_ping, numRowsSource, numColsSource, 1, d_blendedImg);
+  cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+
+  // Blue
+  ComputeG<<<gridSize, blockSize>>>(d_srcBlue, 
+                                    d_mask,
+                                    numRowsSource, numColsSource,
+                                    d_g);
+  cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+  Initialize<<<gridSize, blockSize>>>(d_srcBlue, 
+                                      d_destBlue, 
+                                      d_mask,
+                                      numRowsSource, numColsSource,
+                                      d_ping);
+  cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+  for (size_t k = 0; k < 800; ++k) {
+    Iterate<<<gridSize, blockSize>>>(d_mask,
+                                     d_srcBlue,
+                                     d_destBlue, 
+                                     d_ping, 
+                                     d_g,
+                                     numRowsSource, numColsSource,
+                                     d_pong);
+    cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+    std::swap(d_ping, d_pong);
+  }
+  WriteResult<<<gridSize, blockSize>>>(d_ping, numRowsSource, numColsSource, 2, d_blendedImg);
+  cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+
+  checkCudaErrors(cudaMemcpy(h_blendedImg, d_blendedImg, sizeof(uchar4) * srcSize,
+                             cudaMemcpyDeviceToHost));
+
+  /* 
+     The reference calculation is provided below, feel free to use it
      for debugging purposes. 
-   */
+  */
 
   /*
-    uchar4* h_reference = new uchar4[srcSize];
-    reference_calc(h_sourceImg, numRowsSource, numColsSource,
-                   h_destImg, h_reference);
+  uchar4* h_reference = new uchar4[srcSize];
+  reference_calc(h_sourceImg, numRowsSource, numColsSource, h_destImg, h_reference);
+  memcpy(h_blendedImg, h_reference, sizeof(uchar4) * srcSize);
+  */
 
+  /*
     checkResultsEps((unsigned char *)h_reference, (unsigned char *)h_blendedImg, 4 * srcSize, 2, .01);
-    delete[] h_reference; */
+    delete[] h_reference;
+  */
 }
