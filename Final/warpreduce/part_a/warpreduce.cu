@@ -25,7 +25,20 @@ __device__ unsigned int shared_reduce(unsigned int p, volatile unsigned int * s)
     //
     // TODO: Fill in the rest of this function
 
-    return s[0];
+  int t = threadIdx.x;
+  s[t] = p;
+  if (t < 16)
+    s[t] = s[t] + s[t + 16];
+  if (t < 8)
+    s[t] = s[t] + s[t + 8];
+  if (t < 4)
+    s[t] = s[t] + s[t + 4];
+  if (t < 2)
+    s[t] = s[t] + s[t + 2];
+  if (t < 1)
+    s[t] = s[t] + s[t + 1];
+
+  return s[0];
 }
 
 __global__ void reduce(unsigned int * d_out_shared,
